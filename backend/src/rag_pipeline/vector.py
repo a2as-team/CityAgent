@@ -1,93 +1,60 @@
-from langchain_chroma import Chroma
-from pathlib import Path
+from langchain_community.vectorstores import SupabaseVectorStore
 import os
-import asyncio
 from rag_pipeline.vectorize_excel import vectorize_excel
 from rag_pipeline.vectorize_pdf import vectorize_pdf
 from ai_api_selector import get_embedding_model
+from supabase import create_client, Client
 
-BACKEND_DIR = str(
-    next(p for p in Path(__file__).resolve().parents if p.name == "backend")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_TABLE_NAME = os.getenv("SUPABASE_VECTOR_TABLE", "chunks")
+SUPABASE_QUERY_FN = os.getenv("SUPABASE_QUERY_FUNCTION", "match_chunks")
+
+
+def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars. "
+            "These must be set on the backend only."
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+supabase_client = get_supabase_client()
+embeddings = get_embedding_model()
+vector_store = SupabaseVectorStore(
+    client=supabase_client,
+    embedding=embeddings,
+    table_name=SUPABASE_TABLE_NAME,
+    query_name=SUPABASE_QUERY_FN,
 )
-DATA_DIR = f"{BACKEND_DIR}/data"
-DB_DIR = f"{BACKEND_DIR}/chroma_langchain_db"
-
-all_documents = []
-all_ids = []
+retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
 
-# load and vectorize data
-async def load_data():
-    """Scan `DATA_DIR` for CSV/XLSX files, vectorize them and return lists.
+async def vectorize_file(filepath: str, file_key: str):
+    """
+    Vectorize a file into (documents, ids) using the existing vectorizers.
 
-    This coroutine iterates over files in `DATA_DIR`, calls
-    `vectorize_excel` for CSV/XLSX files, and aggregates all returned
-    documents and ids into two lists which are returned.
+    Args:
+        filepath (str): Path to the file to vectorize.
+        file_key (str): Unique key for the file.
 
     Returns:
-        tuple[list, list]: (documents, ids) where `documents` is a list of
-            `Document` objects and `ids` is a list of their string ids.
+        tuple[list[Document], list[str]]: A tuple containing the list of
+            `Document` objects and a parallel list of their string ids.
     """
+
     documents = []
     ids = []
 
-    if not os.path.exists(DATA_DIR):
-        return documents, ids
+    if filepath.endswith(".pdf"):
+        documents, ids = await vectorize_pdf(filepath, file_key)
+    elif filepath.endswith(".xlsx") or filepath.endswith(".csv"):
+        documents, ids = await vectorize_excel(filepath, file_key)
+    else:
+        raise ValueError(f"Unsupported file type: {filepath}")
 
-    print("Number of files in data directory:", len(os.listdir(DATA_DIR)))
-    for entry in os.scandir(DATA_DIR):
-        print("Processing file:", entry.name)
-        if (
-            entry.name.endswith(".xlsx") or entry.name.endswith(".csv")
-        ) and entry.is_file():
-            # Vectorize spreadsheets
-            curr_documents, curr_ids = await vectorize_excel(entry.path)
-            documents.extend(curr_documents)
-            ids.extend(curr_ids)
-        elif entry.name.endswith(".pdf") and entry.is_file():
-            # Vectorize pdfs
-            # TODO: This might have to extend to pptx, and docx as well...
-            curr_documents, curr_ids = await vectorize_pdf(entry.path) 
-            documents.extend(curr_documents)
-            ids.extend(curr_ids)
-            continue
-        else:
-            print("Skipping non-supported file:", entry.name)
     return documents, ids
-
-
-def query_retriever(query: str):
-    """Run a query against the persisted vector store retriever.
-
-    Args:
-        query (str): The natural-language query to run.
-
-    Returns:
-        Any: The retriever's raw response (depends on configured retriever).
-    """
-
-    return retriever.invoke(query)
-
-
-async def initialize_vector_store():
-    """Initialize module-level document lists by loading and aggregating data.
-
-    Awaits `load_data` and extends the module-level `all_documents` and
-    `all_ids` lists so they are available for subsequent upsert to the
-    vector store. This function does not perform the upsert itself.
-    """
-    docs, ids = await load_data()
-    all_documents.extend(docs)
-    all_ids.extend(ids)
-
-
-embeddings = get_embedding_model()
-vector_store = Chroma(
-    collection_name="city_agent_collection",
-    persist_directory=DB_DIR,
-    embedding_function=embeddings,
-)
-retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
 
 def add_documents_to_vector_store(documents, ids, chunk_size=5000):
@@ -107,8 +74,54 @@ def add_documents_to_vector_store(documents, ids, chunk_size=5000):
         vector_store.add_documents(documents=chunk_docs, ids=chunk_ids)
 
 
-if __name__ == "__main__":
-    asyncio.run(initialize_vector_store())
-    add_documents_to_vector_store(all_documents, all_ids)
-    # vector_store.add_documents(documents=all_documents, ids=all_ids)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+async def ingest_file(filepath: str, file_key: str) -> int:
+    """
+    Vectorize and insert all chunks for a file into Supabase pgvector.
+
+    Args:
+        filepath (str): Path to the file to ingest.
+        file_key (str): Unique key for the file.
+
+    Returns:
+        int: Number of chunks ingested.
+    """
+    documents, ids = await vectorize_file(filepath, file_key)
+    if not documents:
+        return 0
+    add_documents_to_vector_store(documents, ids)
+    return len(documents)
+
+
+def delete_file_chunks(file_key: str) -> int:
+    """
+    Delete all chunks from Supabase where metadata contains {"file_key": file_key}.
+
+    Returns:
+        number of deleted rows if available, else 0
+    """
+
+    res = (
+        supabase_client.table(SUPABASE_TABLE_NAME)
+        .delete()
+        .contains("metadata", {"file_key": file_key})
+        .execute()
+    )
+
+    # supabase-py returns data in res.data when available
+    try:
+        return len(res.data) if res.data else 0
+    except Exception:
+        return 0
+
+
+def query_retriever(query: str):
+    """Run a query against the persisted vector store retriever.
+
+    Args:
+        query (str): The natural-language query to run.
+
+    Returns:
+        Any: The retriever's raw response (depends on configured retriever).
+    """
+
+    return retriever.invoke(query)
