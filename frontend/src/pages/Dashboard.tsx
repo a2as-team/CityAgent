@@ -25,6 +25,33 @@ import { supabase } from "@/lib/client"
 import { useAuth } from "@/context/AuthContext"
 import type { User } from "@supabase/supabase-js"
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL
+const DB_TABLE = "documents"
+const STORAGE_BUCKET = "documents"
+
+async function ingestToRag(bucket: string, path: string, filename: string) {
+  console.log("Ingesting to RAG:", { bucket, path, filename })
+  console.log(`${API_BASE}/rag/ingest`)
+
+  const res = await fetch(`${API_BASE}/rag/ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bucket, path, filename }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+async function deleteFromRag(fileKey: string) {
+  const res = await fetch(`${API_BASE}/rag/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_key: fileKey }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export function Dashboard() {
   const [files, setFiles] = useState<FileRow[]>([])
   const [loading, setLoading] = useState(true)
@@ -35,9 +62,9 @@ export function Dashboard() {
     setLoading(true)
 
     const { data, error } = await supabase
-      .from("documents")
+      .from(DB_TABLE)
       .select("id, owner_id, title, storage_bucket, storage_path, mime_type, size_bytes, created_at, last_updated")
-      .eq("storage_bucket", "documents")
+      .eq("storage_bucket", STORAGE_BUCKET)
       .order("created_at", { ascending: false })
 
     if (error) {
@@ -68,13 +95,15 @@ export function Dashboard() {
     loadFiles()
   }, [user])
 
+
+
   const uploadToSupabase = async (user: User, f: File) => {
     const safeName = f.name.replace(/\s+/g, "_")
     const storagePath = `${crypto.randomUUID()}-${safeName}`
 
     // upload file to storage
     const { error: uploadError } = await supabase.storage
-      .from("documents")
+      .from(STORAGE_BUCKET)
       .upload(storagePath, f, {
         contentType: f.type,
         upsert: false,
@@ -87,10 +116,10 @@ export function Dashboard() {
     }
 
     // insert metadata to DB
-    const { error: dbError } = await supabase.from("documents").insert({
+    const { error: dbError } = await supabase.from(DB_TABLE).insert({
       owner_id: user.id,
       title: f.name,
-      storage_bucket: "documents",
+      storage_bucket: STORAGE_BUCKET,
       storage_path: storagePath,
       mime_type: f.type,
       size_bytes: f.size,
@@ -102,6 +131,19 @@ export function Dashboard() {
       alert(`Uploaded ${f.name} but DB insert failed: ${dbError.message}`)
       await supabase.storage.from("documents").remove([storagePath])
       return
+    }
+
+    console.log("Uploaded to storage:", { bucket: "documents", storagePath })
+
+    // ingest to RAG pipeline
+    try {
+      await ingestToRag("documents", storagePath, f.name)
+    } catch (err) {
+      console.error(err)
+      alert(`Uploaded ${f.name} but RAG ingest failed: ${(err as Error).message}`)
+      // clean up storage + DB
+      await supabase.storage.from("documents").remove([storagePath])
+      await supabase.from("documents").delete().eq("storage_path", storagePath)
     }
   }
 
@@ -120,6 +162,15 @@ export function Dashboard() {
   }
 
   const handleFileDelete = async (row: FileRow) => {
+    // delete from RAG pipeline
+    try {
+      await deleteFromRag(row.storagePath)
+    } catch (err) {
+      console.error(err)
+      alert(`Deleted from storage and DB but RAG delete failed: ${(err as Error).message}`)
+      return
+    }
+
     // delete storage object
     const { error: storageError } = await supabase.storage
       .from("documents")

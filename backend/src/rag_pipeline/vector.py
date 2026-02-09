@@ -1,14 +1,14 @@
 from langchain_community.vectorstores import SupabaseVectorStore
 import os
-from rag_pipeline.vectorize_excel import vectorize_excel
-from rag_pipeline.vectorize_pdf import vectorize_pdf
-from ai_api_selector import get_embedding_model
+from src.rag_pipeline.vectorize_excel import vectorize_excel
+from src.rag_pipeline.vectorize_pdf import vectorize_pdf
+from src.ai_api_selector import get_embedding_model
 from supabase import create_client, Client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE_NAME = os.getenv("SUPABASE_VECTOR_TABLE", "chunks")
-SUPABASE_QUERY_FN = os.getenv("SUPABASE_QUERY_FUNCTION", "match_chunks")
+SUPABASE_QUERY_FN = os.getenv("SUPABASE_QUERY_FUNCTION", "match_chunks_langchain")
 
 
 def get_supabase_client() -> Client:
@@ -28,7 +28,6 @@ vector_store = SupabaseVectorStore(
     table_name=SUPABASE_TABLE_NAME,
     query_name=SUPABASE_QUERY_FN,
 )
-retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
 
 async def vectorize_file(filepath: str, file_key: str):
@@ -114,14 +113,15 @@ def delete_file_chunks(file_key: str) -> int:
         return 0
 
 
-def query_retriever(query: str):
+def query_retriever(query: str, k: int = 4):
     """Run a query against the persisted vector store retriever.
 
     Args:
         query (str): The natural-language query to run.
+        k (int): Number of top similar documents to retrieve.
 
     Returns:
         Any: The retriever's raw response (depends on configured retriever).
     """
 
-    return retriever.invoke(query)
+    return vector_store.similarity_search(query, k=k)

@@ -8,8 +8,7 @@ from langchain_core.documents import Document
 import json
 import asyncio
 import uuid
-from ai_api_selector import get_agent_model
-from ai_api_selector import get_agent_ctx_window_size
+from src.ai_api_selector import get_agent_model, get_agent_ctx_window_size
 import pymupdf4llm
 
 _INSTRUCTIONS = """
@@ -165,7 +164,7 @@ async def call_agent(
     return final_response_content
 
 
-async def vectorize_pdf(filepath: str):
+async def vectorize_pdf(filepath: str, file_key: str):
     """
     Asynchronously vectorize a PDF into a list of langchain_core.documents.Document objects and their UUIDs.
     Behavior:
@@ -235,6 +234,7 @@ async def vectorize_pdf(filepath: str):
         content = item["page_content"]["content_body"]
         meta = item["metadata"]
         meta["filename"] = os.path.basename(filepath)
+        meta["file_key"] = file_key
         meta["last_updated"] = str(ctime(os.path.getmtime(filepath)))
 
         _id = str(uuid.uuid4())

@@ -7,7 +7,7 @@ from google.adk.sessions import InMemorySessionService
 from langchain_core.documents import Document
 import json, re, pandas as pd, asyncio
 import uuid
-from ai_api_selector import get_agent_model
+from src.ai_api_selector import get_agent_model
 
 # from ai_api_selector import get_agent_model
 
@@ -166,7 +166,7 @@ async def call_agent(
     return final_response_content
 
 
-async def vectorize_excel(filepath: str):
+async def vectorize_excel(filepath: str, file_key: str):
     """Vectorize a spreadsheet or CSV into Document objects and ids.
 
     Steps:
@@ -227,7 +227,8 @@ async def vectorize_excel(filepath: str):
                 metadata[col_name] = str(row[col_name])
 
         metadata["filename"] = os.path.basename(filepath)
-        metadata["last_updated"] = str(ctime(os.path.getmtime(filepath))) 
+        metadata["file_key"] = file_key
+        metadata["last_updated"] = str(ctime(os.path.getmtime(filepath)))
 
         id = str(uuid.uuid4())
         doc = Document(page_content=str_page_content, metadata=metadata, id=id)
